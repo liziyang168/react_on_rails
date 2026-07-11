@@ -24,7 +24,6 @@ import { randomUUID } from 'crypto';
 import { rm } from 'fs/promises';
 import { Transform } from 'stream';
 import fastify from 'fastify';
-import fastifyFormbody from '@fastify/formbody';
 import fastifyMultipart, { type MultipartFile } from '@fastify/multipart';
 import log, { sharedLoggerOptions } from './shared/log.js';
 import packageJson from './shared/packageJson.js';
@@ -399,6 +398,8 @@ export const disableHttp2 = () => {
 type WithBodyArrayField<T, K extends string> = T & { [P in K | `${K}[]`]?: string | string[] };
 
 const INVALID_CONTENT_LENGTH_ERROR_CODE = 'FST_ERR_CTP_INVALID_CONTENT_LENGTH';
+const RAW_RENDER_CONTENT_TYPE = 'application/vnd.react-on-rails.render-request+javascript';
+const RAW_RENDER_HEADER_PREFIX = 'x-react-on-rails-pro-';
 
 const errorCode = (error: unknown): string | undefined => {
   const code = (error as { code?: unknown })?.code;
@@ -457,6 +458,64 @@ const extractBodyArrayField = <Key extends string>(
     return [value];
   }
   return undefined;
+};
+
+type RawRenderHeaders = Record<string, unknown>;
+
+const scalarHeader = (headers: RawRenderHeaders, name: string) => {
+  const value = headers[name];
+  return typeof value === 'string' ? value : undefined;
+};
+
+const normalizeRawRenderRequest = (
+  renderingRequest: unknown,
+  headers: RawRenderHeaders,
+): { body?: Record<string, unknown>; error?: string } => {
+  if (typeof renderingRequest !== 'string') {
+    return { error: 'Invalid raw render request body: expected a JavaScript string.' };
+  }
+
+  const authorization = scalarHeader(headers, 'authorization');
+  if (authorization && !authorization.startsWith('Bearer ')) {
+    return { error: 'Invalid Authorization header for raw render request.' };
+  }
+
+  const dependencyHeader = scalarHeader(headers, `${RAW_RENDER_HEADER_PREFIX}dependency-bundle-timestamps`);
+  let dependencyBundleTimestamps: unknown = [];
+  if (dependencyHeader !== undefined) {
+    try {
+      dependencyBundleTimestamps = JSON.parse(dependencyHeader);
+    } catch {
+      return { error: 'Invalid dependency bundle timestamps header: expected a JSON array.' };
+    }
+    if (
+      !Array.isArray(dependencyBundleTimestamps) ||
+      !dependencyBundleTimestamps.every((timestamp) => typeof timestamp === 'string')
+    ) {
+      return { error: 'Invalid dependency bundle timestamps header: expected an array of strings.' };
+    }
+  }
+
+  const observabilityHeader = scalarHeader(headers, `${RAW_RENDER_HEADER_PREFIX}rsc-stream-observability`);
+  if (
+    observabilityHeader !== undefined &&
+    observabilityHeader !== 'true' &&
+    observabilityHeader !== 'false'
+  ) {
+    return { error: 'Invalid RSC stream observability header: expected true or false.' };
+  }
+
+  return {
+    body: {
+      renderingRequest,
+      protocolVersion: scalarHeader(headers, `${RAW_RENDER_HEADER_PREFIX}protocol-version`),
+      gemVersion: scalarHeader(headers, `${RAW_RENDER_HEADER_PREFIX}gem-version`),
+      railsEnv: scalarHeader(headers, `${RAW_RENDER_HEADER_PREFIX}rails-env`),
+      password: authorization?.slice('Bearer '.length),
+      dependencyBundleTimestamps,
+      ...(observabilityHeader === undefined ? {} : { rscStreamObservability: observabilityHeader }),
+    },
+  };
 };
 
 function discardMultipartFile(part: MultipartFile) {
@@ -534,8 +593,6 @@ export default function run(config: Partial<Config>) {
     }
   });
 
-  // Supports application/x-www-form-urlencoded
-  void app.register(fastifyFormbody);
   // Supports multipart/form-data
   void app.register(fastifyMultipart, {
     attachFieldsToBody: 'keyValues',
@@ -584,6 +641,10 @@ export default function run(config: Partial<Config>) {
     },
   });
 
+  app.addContentTypeParser(RAW_RENDER_CONTENT_TYPE, { parseAs: 'string' }, (_req, body, done) => {
+    done(null, body);
+  });
+
   // Ensure NDJSON bodies are not buffered and are available as a stream immediately
   app.addContentTypeParser('application/x-ndjson', (req, payload, done) => {
     // Pass through the raw stream; the route will consume req.raw
@@ -598,7 +659,25 @@ export default function run(config: Partial<Config>) {
     // Can't infer from the route like Express can
     Params: { bundleTimestamp: string; renderRequestDigest: string };
   }>('/bundles/:bundleTimestamp/render/:renderRequestDigest', async (req, res) => {
-    const precheckResult = performRequestPrechecks(req.body);
+    let body: Record<string, unknown>;
+    if (req.headers['content-type']?.split(';', 1)[0] === RAW_RENDER_CONTENT_TYPE) {
+      const normalizedRequest = normalizeRawRenderRequest(req.body, req.headers);
+      if (normalizedRequest.error || !normalizedRequest.body) {
+        await setResponse(
+          badRequestResponseResult(normalizedRequest.error ?? 'Invalid raw render request.'),
+          res,
+        );
+        return;
+      }
+      body = normalizedRequest.body;
+    } else if (req.body && typeof req.body === 'object') {
+      body = req.body;
+    } else {
+      await setResponse(badRequestResponseResult('Invalid or missing request body.'), res);
+      return;
+    }
+
+    const precheckResult = performRequestPrechecks(body);
     if (precheckResult) {
       await setResponse(precheckResult, res);
       return;
@@ -615,11 +694,6 @@ export default function run(config: Partial<Config>) {
     //   await delay(100000);
     // }
 
-    const { body } = req;
-    if (!body || typeof body !== 'object') {
-      await setResponse(badRequestResponseResult('Invalid or missing request body.'), res);
-      return;
-    }
     const { renderingRequest } = body;
     if (!isValidRenderingRequest(renderingRequest)) {
       await setResponse(badRequestResponseResult(invalidRenderingRequestMessage(body)), res);
