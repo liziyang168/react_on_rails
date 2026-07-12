@@ -48,6 +48,18 @@ module TrackBenchmarks
       BenchmarkTable.new(title: "#{suite_name} Benchmark Summary", rows:, report:).to_markdown
     end
 
+    # Per-sample raw values from a display sidecar, keyed by benchmark name — the
+    # shape BencherReport#apply_sample_confirmation! consumes. Rows without a
+    # "samples" key (single-sample runs, failed routes) are skipped; a missing or
+    # invalid sidecar yields {} (the caller then skips confirmation, failing open).
+    def samples_by_name(display_json)
+      display_rows(display_json).each_with_object({}) do |row, samples|
+        next unless row.is_a?(Hash) && row["samples"].is_a?(Hash) && row["name"]
+
+        samples[row["name"]] = row["samples"]
+      end
+    end
+
     # Body for the report-regressions hand-off. Normally the rendered table; but if the
     # display sidecar was missing/corrupt rendered_report returned "" — don't hand off an
     # empty-bodied regression issue. Substitute a run-URL pointer (and shout via ::error::)

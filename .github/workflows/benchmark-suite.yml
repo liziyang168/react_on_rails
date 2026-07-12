@@ -11,6 +11,14 @@ name: Benchmark Suite (reusable)
 # across runners, whose cross-runner variance was noise-dominated on shared
 # GitHub-hosted runners (#4071).
 #
+# Both phases run the HEAD ref's benchmarks/ tree (stashed outside the workspace by
+# the "Stash head benchmark harness" step): the harness is the measuring instrument,
+# so measuring both refs with one instrument keeps harness changes from reading as
+# performance deltas. Each phase still builds and serves its own ref's app code.
+# Additionally, each route is sampled BENCHMARK_SAMPLES times per phase; medians ship
+# to Bencher and a boundary crossing must reproduce across samples (disjoint
+# base/head sample ranges) or the report downgrades it to "unconfirmed".
+#
 # Called twice by benchmark.yml so the INITIAL run and the fresh-runner CONFIRMATION
 # rerun execute the exact same steps (no drift):
 #
@@ -57,6 +65,13 @@ env:
   ROUTES: ${{ github.event.inputs.routes }}
   RATE: ${{ github.event.inputs.rate || 'max' }}
   DURATION: ${{ github.event.inputs.duration }}
+  # Repeated k6 samples per route (bench.rb): medians ship to Bencher and the
+  # per-sample values let the relative comparison require a flagged change to
+  # reproduce across samples (#4580). Per-sample duration defaults to 12s when
+  # sampling (3x12s vs the old single 30s); an explicit DURATION input overrides
+  # per sample. Only the k6 suites read this; the vegeta node-renderer suite
+  # keeps its single fixed-rate run.
+  BENCHMARK_SAMPLES: '3'
   REQUEST_TIMEOUT: ${{ github.event.inputs.request_timeout }}
   CONNECTIONS: ${{ github.event.inputs.connections }}
   MAX_CONNECTIONS: ${{ github.event.inputs.connections }}
@@ -240,6 +255,21 @@ jobs:
           fi
           echo "Comparison base: $BASE_SHA"
 
+      # The bench harness (benchmarks/) is the measuring instrument. BOTH phases must
+      # run the HEAD ref's copy: each phase checks out its own ref, so running the
+      # checked-out benchmarks/ would measure the two refs with two different
+      # instruments, and any harness change (k6 connection behavior, sampling,
+      # durations) would masquerade as a base-vs-head performance delta. Stash the
+      # head copy outside the workspace (phases git-clean it) while the head ref is
+      # still checked out; the phase action runs scripts from this stash. App-side
+      # inputs (bin/prod*, gems, packs, renderer config) still come from each
+      # phase's own checkout — only the instrument is pinned.
+      - name: Stash head benchmark harness
+        run: |
+          rm -rf "$RUNNER_TEMP/bench-harness"
+          cp -R benchmarks "$RUNNER_TEMP/bench-harness"
+          echo "Stashed head benchmarks/ -> $RUNNER_TEMP/bench-harness"
+
       # Relative continuous benchmarking, phase 1 of 2: build + benchmark the comparison
       # BASE ref on this runner. Its results are stashed under runner.temp because the
       # head phase git-cleans the workspace.
@@ -254,6 +284,7 @@ jobs:
           pro-env: ${{ env.PRO_ENV }}
           generate-packs: ${{ env.GENERATE_PACKS }}
           benchmark-script: ${{ env.BENCHMARK_SCRIPT }}
+          harness-dir: ${{ runner.temp }}/bench-harness
           benchmark-timeout-minutes: ${{ fromJSON(inputs.matrix_row).benchmark_timeout_minutes }}
           suite-name: ${{ env.SUITE_NAME }}
           summary-file: ${{ env.SUMMARY_FILE }}
@@ -280,6 +311,7 @@ jobs:
           pro-env: ${{ env.PRO_ENV }}
           generate-packs: ${{ env.GENERATE_PACKS }}
           benchmark-script: ${{ env.BENCHMARK_SCRIPT }}
+          harness-dir: ${{ runner.temp }}/bench-harness
           benchmark-timeout-minutes: ${{ fromJSON(inputs.matrix_row).benchmark_timeout_minutes }}
           suite-name: ${{ env.SUITE_NAME }}
           summary-file: ${{ env.SUMMARY_FILE }}
@@ -323,6 +355,9 @@ jobs:
           # The base phase's results — this runner's own comparison baseline.
           BENCHMARK_BASELINE_JSON: ${{ runner.temp }}/bench_results_base/benchmark.json
           BENCHER_BASELINE_REPORT_JSON: ${{ runner.temp }}/bench_results_base/bencher_report.json
+          # The base phase's per-sample values, paired with the head sidecar for
+          # sample confirmation (unreproduced boundary crossings are downgraded).
+          BENCHMARK_BASELINE_DISPLAY_JSON: ${{ runner.temp }}/bench_results_base/benchmark_display.json
           # Confirmation mode reads the downloaded candidate from here (recursive glob).
           BENCHMARK_CANDIDATE_DIR: candidate
         run: ruby benchmarks/track_benchmarks.rb

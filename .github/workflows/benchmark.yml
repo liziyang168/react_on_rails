@@ -13,9 +13,12 @@ on:
         default: 'max'
         type: string
       duration:
-        description: 'Duration (e.g., "30s", "1m", "90s")'
+        description: >-
+          k6 duration PER SAMPLE (e.g., "12s", "30s", "1m") — each route runs
+          BENCHMARK_SAMPLES (3) k6 samples and reports the medians. Empty = auto
+          (12s per sample). Also the vegeta node-renderer suite's single-run duration.
         required: false
-        default: '30s'
+        default: ''
         type: string
       request_timeout:
         description: 'Request timeout (e.g., "60s", "1m", "90s")'
