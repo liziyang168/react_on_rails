@@ -24,6 +24,7 @@ import { randomUUID } from 'crypto';
 import { rm } from 'fs/promises';
 import { Transform } from 'stream';
 import fastify from 'fastify';
+import fastifyFormbody from '@fastify/formbody';
 import fastifyMultipart, { type MultipartFile } from '@fastify/multipart';
 import log, { sharedLoggerOptions } from './shared/log.js';
 import packageJson from './shared/packageJson.js';
@@ -107,45 +108,27 @@ function setHeaders(headers: ResponseResult['headers'], res: FastifyReply) {
   Object.entries(headers).forEach(([key, header]) => res.header(key, header));
 }
 
-function hasHeader(headers: ResponseResult['headers'], headerName: string) {
-  const lowerHeaderName = headerName.toLowerCase();
-  return Object.keys(headers).some((key) => key.toLowerCase() === lowerHeaderName);
-}
-
-function setStringResponseHeaders(headers: ResponseResult['headers'], res: FastifyReply) {
-  if (!hasHeader(headers, 'Content-Type')) {
-    res.type('text/plain; charset=utf-8');
-  }
-  if (!hasHeader(headers, 'X-Content-Type-Options')) {
-    res.header('X-Content-Type-Options', 'nosniff');
-  }
-}
-
 const setResponse = async (result: ResponseResult, res: FastifyReply) => {
   const { status, data, headers, stream } = result;
   if (status !== 200 && status !== 410) {
     log.info({ msg: 'Sending non-200, non-410 data back', data });
-  }
-  if (!stream && typeof data === 'string' && status >= 400) {
-    setHeaders(headers, res);
-    res.header('Content-Type', 'text/plain; charset=utf-8');
-    res.header('X-Content-Type-Options', 'nosniff');
-    res.status(status);
-    res.send(data);
-    return;
-  }
-
-  if (!stream && typeof data === 'string') {
-    setStringResponseHeaders(headers, res);
   }
   setHeaders(headers, res);
   res.status(status);
 
   if (stream) {
     await res.send(stream);
-  } else {
-    res.send(data);
+    return;
   }
+
+  if (typeof data === 'string') {
+    // String payloads (rendered output and error text) may embed request-derived
+    // content; the Rails client reads them as raw text, so an explicit non-HTML
+    // content type keeps reflected markup inert if a browser hits this endpoint.
+    res.header('Content-Type', 'text/plain; charset=utf-8');
+    res.header('X-Content-Type-Options', 'nosniff');
+  }
+  res.send(data);
 };
 
 function runWhenStreamFinishes(
@@ -518,6 +501,17 @@ const normalizeRawRenderRequest = (
   };
 };
 
+// Extracts only the precheck fields, without shape validation, so protocol and password
+// checks run before normalizeRawRenderRequest's 400s; a malformed but unauthenticated
+// raw request must fail auth first, matching the parsed-body path and /asset-exists.
+const rawRenderPrecheckBody = (headers: RawRenderHeaders) => {
+  const authorization = scalarHeader(headers, 'authorization');
+  return {
+    protocolVersion: scalarHeader(headers, `${RAW_RENDER_HEADER_PREFIX}protocol-version`),
+    password: authorization?.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : authorization,
+  };
+};
+
 function discardMultipartFile(part: MultipartFile) {
   part.file.resume();
   // eslint-disable-next-line no-param-reassign
@@ -593,6 +587,11 @@ export default function run(config: Partial<Config>) {
     }
   });
 
+  // Supports application/x-www-form-urlencoded. The gem no longer sends it (render
+  // requests use RAW_RENDER_CONTENT_TYPE), but keep parsing it so a not-yet-upgraded
+  // gem in a rolling deploy still reaches the protocol/render path instead of failing
+  // with an unactionable 415 at the content-type layer.
+  void app.register(fastifyFormbody);
   // Supports multipart/form-data
   void app.register(fastifyMultipart, {
     attachFieldsToBody: 'keyValues',
@@ -661,6 +660,11 @@ export default function run(config: Partial<Config>) {
   }>('/bundles/:bundleTimestamp/render/:renderRequestDigest', async (req, res) => {
     let body: Record<string, unknown>;
     if (req.headers['content-type']?.split(';', 1)[0] === RAW_RENDER_CONTENT_TYPE) {
+      const precheckResult = performRequestPrechecks(rawRenderPrecheckBody(req.headers));
+      if (precheckResult) {
+        await setResponse(precheckResult, res);
+        return;
+      }
       const normalizedRequest = normalizeRawRenderRequest(req.body, req.headers);
       if (normalizedRequest.error || !normalizedRequest.body) {
         await setResponse(
@@ -672,14 +676,13 @@ export default function run(config: Partial<Config>) {
       body = normalizedRequest.body;
     } else if (req.body && typeof req.body === 'object') {
       body = req.body;
+      const precheckResult = performRequestPrechecks(body);
+      if (precheckResult) {
+        await setResponse(precheckResult, res);
+        return;
+      }
     } else {
       await setResponse(badRequestResponseResult('Invalid or missing request body.'), res);
-      return;
-    }
-
-    const precheckResult = performRequestPrechecks(body);
-    if (precheckResult) {
-      await setResponse(precheckResult, res);
       return;
     }
 

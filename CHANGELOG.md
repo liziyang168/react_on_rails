@@ -74,6 +74,19 @@ After a release, run `/update-changelog` in Claude Code to analyze commits, writ
   mismatches on streamed RSC apps such as the flagship demo. Fixes
   [Issue 4525](https://github.com/shakacode/react_on_rails/issues/4525). [PR 4532](https://github.com/shakacode/react_on_rails/pull/4532) by [justin808](https://github.com/justin808).
 
+#### Changed
+
+- **[Pro] Render requests now send raw JavaScript bodies to the Node renderer**: Non-bundle render
+  requests use a raw `application/vnd.react-on-rails.render-request+javascript` body with metadata in
+  `X-React-On-Rails-Pro-*` headers instead of `application/x-www-form-urlencoded`, removing
+  URL-encoding overhead on large rendering payloads. The renderer still accepts the legacy form
+  encoding, so a not-yet-upgraded gem keeps working against an upgraded renderer during rolling
+  deploys; deploy the Node renderer before or together with the gem upgrade, since an older renderer
+  rejects the new content type. Fixes
+  [Issue 3584](https://github.com/shakacode/react_on_rails/issues/3584).
+  [PR 4579](https://github.com/shakacode/react_on_rails/pull/4579) by
+  [alexeyr-ci2](https://github.com/alexeyr-ci2).
+
 #### Added
 
 - **[Pro] Configurable license-token secret sources**: Rails applications can now provide a paid
