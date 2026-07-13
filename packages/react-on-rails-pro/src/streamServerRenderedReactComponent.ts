@@ -231,6 +231,7 @@ const streamRenderReactComponent = (
                 {
                   rscClientManifestStylesheetHrefs,
                   rscStreamObservability: railsContext.rscStreamObservability,
+                  railsEnv: railsContext.railsEnv,
                 },
               ),
             );
